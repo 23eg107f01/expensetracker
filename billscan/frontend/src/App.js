@@ -32,6 +32,21 @@ const CATEGORY_ICONS = {
   Other: "🧾"
 };
 
+const EXPENSE_CATEGORIES = [
+  "Food & Dining",
+  "Groceries",
+  "Transportation",
+  "Healthcare",
+  "Shopping",
+  "Entertainment",
+  "Utilities",
+  "Travel",
+  "Education",
+  "Personal Care",
+  "Office Supplies",
+  "Other"
+];
+
 const BILL_RULES = [
   { category: "Food & Dining", subCategory: "Restaurant", terms: ["restaurant", "cafe", "coffee", "dining", "pizza", "burger", "lunch", "dinner", "breakfast", "biryani", "noodles", "naan", "thali", "meal", "food", "mcdonald", "subway", "starbucks"] },
   { category: "Groceries", subCategory: "Supermarket", terms: ["grocery", "supermarket", "groceries", "market", "mart", "fresh", "bigbasket", "walmart", "target", "costco"] },
@@ -399,6 +414,7 @@ function App() {
   const [analysisLoading, setAnalysisLoading] = useState(false);
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
+  const [isSaving, setIsSaving] = useState(false);
   const [activeTab, setActiveTab] = useState("upload");
   const [ocrMode, setOcrMode] = useState("fast");
   const ocrWorkerRef = useRef(null);
@@ -492,10 +508,25 @@ function App() {
     setAnalysisLoading(true);
     setError("");
     try {
-      setAnalysis(buildLocalInsight(summaryData, primaryCurrency));
+      const response = await fetch("/api/analyze-spending", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ summary: summaryData })
+      });
+      const data = await parseResponse(response);
+      if (!response.ok) throw new Error(data?.error || data?.__text || "Failed to generate analysis");
+
+      setAnalysis(data?.analysis || buildLocalInsight(summaryData, primaryCurrency));
     } finally {
       setAnalysisLoading(false);
     }
+  }
+
+  function handleFormChange(field, value) {
+    setForm((current) => ({
+      ...current,
+      [field]: value
+    }));
   }
 
   function handleSelectFile(file) {
@@ -540,13 +571,50 @@ function App() {
       const baseAnalysis = analyzeBillText(text);
       // Prefer visually prominent text (large title/logo) as merchant when available from OCR bounding boxes
       const visualMerchant = extractMerchantFromOcrResult(result, text);
+      let geminiAnalysis = null;
+      try {
+        setScanProgress("Enhancing receipt data with Google AI...");
+        const response = await fetch("/api/analyze-receipt", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text, fallback: baseAnalysis, summary })
+        });
+        const data = await parseResponse(response);
+        if (response.ok) {
+          geminiAnalysis = data?.analysis || null;
+        }
+      } catch {
+        geminiAnalysis = null;
+      }
+
       const scannedExpense = {
         ...baseAnalysis,
+        ...(geminiAnalysis || {}),
         merchant: visualMerchant || baseAnalysis.merchant,
         receipt_file_name: selectedFile.name,
         ocr_text: text,
-        source: "ocr"
+        source: "ocr",
+        ai_provider: geminiAnalysis ? "google-gemini" : "local"
       };
+
+      if (geminiAnalysis?.merchant && !visualMerchant) {
+        scannedExpense.merchant = geminiAnalysis.merchant;
+      }
+
+      if (geminiAnalysis?.description) {
+        scannedExpense.description = geminiAnalysis.description;
+      }
+
+      if (geminiAnalysis?.notes) {
+        scannedExpense.notes = geminiAnalysis.notes;
+      }
+
+      if (geminiAnalysis?.total_amount !== undefined && geminiAnalysis?.total_amount !== null) {
+        const parsedTotal = Number(geminiAnalysis.total_amount);
+        if (Number.isFinite(parsedTotal)) {
+          scannedExpense.total_amount = parsedTotal;
+        }
+      }
 
       setForm(scannedExpense);
       setSuccess(`Extracted ${scannedExpense.merchant || "expense"} for ${formatCurrency(scannedExpense.total_amount, scannedExpense.currency)}.`);
@@ -556,6 +624,56 @@ function App() {
     } finally {
       setIsScanning(false);
       setScanProgress("");
+    }
+  }
+
+  async function handleSaveScannedBill() {
+    const totalAmount = Number(form.total_amount);
+
+    if (!form.merchant?.trim()) {
+      setError("Merchant is required before saving.");
+      return;
+    }
+
+    if (!Number.isFinite(totalAmount)) {
+      setError("Total amount must be a valid number before saving.");
+      return;
+    }
+
+    setIsSaving(true);
+    setError("");
+    setSuccess("");
+
+    try {
+      const payload = {
+        ...form,
+        total_amount: totalAmount,
+        receipt_file_name: selectedFile?.name || form.receipt_file_name || "",
+        source: form.source || (selectedFile ? "ocr" : "manual")
+      };
+
+      const response = await fetch("/api/expenses", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      const data = await parseResponse(response);
+
+      if (!response.ok) {
+        throw new Error(data?.error || data?.__text || "Failed to save bill");
+      }
+
+      await fetchExpenses();
+      const nextSummary = await fetchSummary();
+      if (nextSummary) {
+        fetchAnalysis(nextSummary);
+      }
+      setActiveTab("expenses");
+      setSuccess(`Saved ${payload.merchant} for ${formatCurrency(payload.total_amount, payload.currency)}.`);
+    } catch (saveError) {
+      setError(normalizeErrorMessage(saveError.message || "Failed to save bill"));
+    } finally {
+      setIsSaving(false);
     }
   }
 
@@ -618,7 +736,10 @@ function App() {
               previewUrl={previewUrl}
               onSelectFile={handleSelectFile}
               onScanImage={handleScanImage}
+              onSaveBill={handleSaveScannedBill}
+              onFormChange={handleFormChange}
               isScanning={isScanning}
+              isSaving={isSaving}
               scanProgress={scanProgress}
               ocrMode={ocrMode}
               onOcrModeChange={setOcrMode}
@@ -638,7 +759,7 @@ function App() {
             ) : (
               <div className="expense-list">
                 {expenses.map((expense) => (
-                  <ExpenseCard key={expense.id} expense={expense} onDelete={handleDelete} />
+                  <ExpenseCard key={expense.id} expense={expense} onDelete={handleDelete} onEdit={() => { fetchExpenses(); fetchSummary(); }} />
                 ))}
               </div>
             )}
@@ -673,7 +794,7 @@ function App() {
   );
 }
 
-function ExpenseForm({ form, selectedFile, previewUrl, onSelectFile, onScanImage, isScanning, scanProgress, ocrMode, onOcrModeChange }) {
+function ExpenseForm({ form, selectedFile, previewUrl, onSelectFile, onScanImage, onSaveBill, onFormChange, isScanning, isSaving, scanProgress, ocrMode, onOcrModeChange }) {
   return (
     <div className="expense-form">
       <div className="scan-panel">
@@ -708,17 +829,68 @@ function ExpenseForm({ form, selectedFile, previewUrl, onSelectFile, onScanImage
           </button>
           {scanProgress && <span className="scan-status">{scanProgress}</span>}
         </div>
+
+        <div className="scan-actions-row">
+          <button className="btn btn-primary" type="button" onClick={onSaveBill} disabled={isScanning || isSaving || !selectedFile}>
+            {isSaving ? (<><span className="spinner" />Saving...</>) : "💾 Save Scanned Bill"}
+          </button>
+          <span className="scan-status">Scan first, then review or edit fields before saving.</span>
+        </div>
       </div>
 
-      
-
-      <div className="extracted-summary">
-        <div className="summary-chip"><span>Merchant</span><strong>{form?.merchant || "—"}</strong></div>
-        <div className="summary-chip"><span>Date</span><strong>{form?.date || "—"}</strong></div>
-        <div className="summary-chip"><span>Total</span><strong>{formatCurrency(form?.total_amount, form?.currency)}</strong></div>
-        <div className="summary-chip"><span>Category</span><strong>{form?.category || "—"}</strong></div>
-        <div className="summary-chip"><span>Payment</span><strong>{form?.payment_method || "—"}</strong></div>
-        <div className="summary-chip wide"><span>Confidence</span><strong>{form?.confidence || "low"}</strong></div>
+      <div className="extracted-summary editable-summary">
+        <label className="field">
+          <span>Merchant</span>
+          <input type="text" value={form?.merchant || ""} onChange={(event) => onFormChange("merchant", event.target.value)} />
+        </label>
+        <label className="field">
+          <span>Date</span>
+          <input type="date" value={form?.date || ""} onChange={(event) => onFormChange("date", event.target.value)} />
+        </label>
+        <label className="field">
+          <span>Total</span>
+          <input type="number" step="0.01" value={form?.total_amount ?? ""} onChange={(event) => onFormChange("total_amount", event.target.value)} />
+        </label>
+        <label className="field">
+          <span>Currency</span>
+          <input type="text" maxLength="3" value={form?.currency || "INR"} onChange={(event) => onFormChange("currency", event.target.value.toUpperCase())} />
+        </label>
+        <label className="field">
+          <span>Category</span>
+          <select value={form?.category || "Other"} onChange={(event) => onFormChange("category", event.target.value)}>
+            {EXPENSE_CATEGORIES.map((category) => (
+              <option key={category} value={category}>{category}</option>
+            ))}
+          </select>
+        </label>
+        <label className="field">
+          <span>Subcategory</span>
+          <input type="text" value={form?.sub_category || ""} onChange={(event) => onFormChange("sub_category", event.target.value)} />
+        </label>
+        <label className="field">
+          <span>Payment</span>
+          <input type="text" value={form?.payment_method || ""} onChange={(event) => onFormChange("payment_method", event.target.value)} />
+        </label>
+        <label className="field">
+          <span>Tax</span>
+          <input type="number" step="0.01" value={form?.tax_amount ?? ""} onChange={(event) => onFormChange("tax_amount", event.target.value)} />
+        </label>
+        <label className="field">
+          <span>Discount</span>
+          <input type="number" step="0.01" value={form?.discount_amount ?? ""} onChange={(event) => onFormChange("discount_amount", event.target.value)} />
+        </label>
+        <label className="field wide">
+          <span>Description</span>
+          <textarea value={form?.description || ""} onChange={(event) => onFormChange("description", event.target.value)} />
+        </label>
+        <label className="field wide">
+          <span>Notes</span>
+          <textarea value={form?.notes || ""} onChange={(event) => onFormChange("notes", event.target.value)} />
+        </label>
+        <label className="field wide">
+          <span>Confidence</span>
+          <input type="text" value={form?.confidence || "low"} onChange={(event) => onFormChange("confidence", event.target.value)} />
+        </label>
       </div>
     </div>
   );
@@ -741,11 +913,74 @@ function SummaryBar({ summary, expenses }) {
   );
 }
 
-function ExpenseCard({ expense, onDelete }) {
+function ExpenseCard({ expense, onDelete, onEdit }) {
   const [expanded, setExpanded] = useState(false);
+  const [isEditing, setIsEditing] = useState(false);
+  const [editForm, setEditForm] = useState(expense);
   const category = expense.category || "Other";
   const color = CATEGORY_COLORS[category] || CATEGORY_COLORS.Other;
   const icon = CATEGORY_ICONS[category] || CATEGORY_ICONS.Other;
+
+  const handleEditChange = (field, value) => {
+    setEditForm((prev) => ({ ...prev, [field]: value }));
+  };
+
+  const handleSaveEdit = async () => {
+    try {
+      const response = await fetch(`/api/expenses/${expense.id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(editForm)
+      });
+      const data = await parseResponse(response);
+      if (!response.ok) throw new Error(data?.error || "Failed to update expense");
+      onEdit();
+      setIsEditing(false);
+    } catch (error) {
+      alert(error.message);
+    }
+  };
+
+  if (isEditing) {
+    return (
+      <article className="expense-card" style={{ "--category-color": color }}>
+        <div className="expense-top">
+          <h3>Edit Expense</h3>
+        </div>
+        <div className="edit-form">
+          <div className="form-group">
+            <label>Merchant <input type="text" value={editForm.merchant || ""} onChange={(e) => handleEditChange("merchant", e.target.value)} /></label>
+          </div>
+          <div className="form-group">
+            <label>Date <input type="date" value={editForm.date || ""} onChange={(e) => handleEditChange("date", e.target.value)} /></label>
+          </div>
+          <div className="form-group">
+            <label>Total Amount <input type="number" step="0.01" value={editForm.total_amount || ""} onChange={(e) => handleEditChange("total_amount", e.target.value)} /></label>
+          </div>
+          <div className="form-group">
+            <label>Currency <input type="text" value={editForm.currency || "INR"} onChange={(e) => handleEditChange("currency", e.target.value)} /></label>
+          </div>
+          <div className="form-group">
+            <label>Category
+              <select value={editForm.category || "Other"} onChange={(e) => handleEditChange("category", e.target.value)}>
+                {EXPENSE_CATEGORIES.map((c) => (<option key={c} value={c}>{c}</option>))}
+              </select>
+            </label>
+          </div>
+          <div className="form-group">
+            <label>Payment Method <input type="text" value={editForm.payment_method || ""} onChange={(e) => handleEditChange("payment_method", e.target.value)} /></label>
+          </div>
+          <div className="form-group">
+            <label>Notes <textarea value={editForm.notes || ""} onChange={(e) => handleEditChange("notes", e.target.value)} /></label>
+          </div>
+          <div className="edit-actions">
+            <button className="btn btn-primary" onClick={handleSaveEdit}>💾 Save</button>
+            <button className="btn btn-secondary" onClick={() => { setIsEditing(false); setEditForm(expense); }}>Cancel</button>
+          </div>
+        </div>
+      </article>
+    );
+  }
 
   return (
     <article className="expense-card" style={{ "--category-color": color }}>
@@ -757,6 +992,7 @@ function ExpenseCard({ expense, onDelete }) {
         <div className="expense-actions">
           <span className="expense-amount">{formatCurrency(expense.total_amount, expense.currency)}</span>
           <span className="category-badge">{category}</span>
+          <button className="icon-btn edit" type="button" aria-label={`Edit ${expense.merchant || "expense"}`} onClick={() => setIsEditing(true)}>✎</button>
           <button className="icon-btn danger" type="button" aria-label={`Delete ${expense.merchant || "expense"}`} onClick={() => onDelete(expense.id)}>×</button>
           <button className={expanded ? "icon-btn chevron open" : "icon-btn chevron"} type="button" aria-label={expanded ? "Collapse expense" : "Expand expense"} onClick={() => setExpanded((current) => !current)}>▾</button>
         </div>
