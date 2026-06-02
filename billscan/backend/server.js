@@ -2,16 +2,25 @@ import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import { Client } from "langsmith";
+import { MongoClient } from "mongodb";
 import { promises as fs } from "node:fs";
 import path from "node:path";
+import os from "node:os";
 import { fileURLToPath } from "node:url";
 
 const app = express();
 const PORT =  process.env.PORT || 3001;
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const DATA_DIR = path.join(__dirname, "data");
+// Use a writable temp directory for serverless environments. Allow override via DATA_DIR env.
+const DEFAULT_DATA_DIR = path.join(os.tmpdir(), "expensetracker-data");
+const DATA_DIR = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : DEFAULT_DATA_DIR;
 const DATA_FILE = path.join(DATA_DIR, "expenses.json");
+
+// MongoDB configuration
+const MONGODB_URI = process.env.MONGODB_URI;
+let mongoClient = null;
+let expensesCollection = null;
 
 // Initialize LangSmith client
 const langsmithClient = process.env.LANGSMITH_API_KEY && process.env.LANGSMITH_TRACING !== "false" ? new Client({
@@ -211,16 +220,90 @@ async function createReceiptAnalysis({ text, fallback = {}, summary = {} }) {
   return { analysis, provider: "google-gemini" };
 }
 
+let expenses = [];
+let idCounter = 1;
+
+async function connectToMongoDB() {
+  if (!MONGODB_URI) {
+    return;
+  }
+
+  try {
+    mongoClient = new MongoClient(MONGODB_URI);
+    await mongoClient.connect();
+    const db = mongoClient.db("expensetracker");
+    expensesCollection = db.collection("expenses");
+    console.log("Connected to MongoDB Atlas");
+
+    // Create indexes
+    await expensesCollection.createIndex({ id: 1 }, { unique: true });
+    await expensesCollection.createIndex({ created_at: -1 });
+  } catch (error) {
+    console.error("MongoDB connection failed:", error.message);
+    mongoClient = null;
+    expensesCollection = null;
+  }
+}
+
 async function saveExpensesToDisk() {
-  await fs.mkdir(DATA_DIR, { recursive: true });
-  await fs.writeFile(
-    DATA_FILE,
-    JSON.stringify({ expenses, updated_at: new Date().toISOString() }, null, 2),
-    "utf8"
-  );
+  if (expensesCollection) {
+    try {
+      // Store all expenses in MongoDB
+      for (const expense of expenses) {
+        await expensesCollection.updateOne(
+          { id: expense.id },
+          { $set: expense },
+          { upsert: true }
+        );
+      }
+    } catch (error) {
+      console.error("Failed to save expenses to MongoDB:", error.message);
+    }
+  } else {
+    // Fallback to local storage
+    try {
+      await fs.mkdir(DATA_DIR, { recursive: true });
+      await fs.writeFile(
+        DATA_FILE,
+        JSON.stringify({ expenses, updated_at: new Date().toISOString() }, null, 2),
+        "utf8"
+      );
+    } catch (error) {
+      console.error("Failed to save expenses to disk:", error.message);
+    }
+  }
+}
+
+async function loadExpensesFromDisk() {
+  if (expensesCollection) {
+    try {
+      expenses = await expensesCollection.find({}).toArray();
+      // Remove MongoDB's _id field
+      expenses = expenses.map(({ _id, ...expense }) => expense);
+      idCounter = Math.max(...expenses.map(e => e.id || 0), 0) + 1;
+      console.log(`Loaded ${expenses.length} expenses from MongoDB`);
+    } catch (error) {
+      console.error("Failed to load expenses from MongoDB:", error.message);
+      expenses = [];
+      idCounter = 1;
+    }
+  } else {
+    // Fallback to local storage
+    try {
+      const data = await fs.readFile(DATA_FILE, "utf8");
+      const parsed = JSON.parse(data);
+      expenses = Array.isArray(parsed.expenses) ? parsed.expenses : [];
+      idCounter = Math.max(...expenses.map(e => e.id || 0), 0) + 1;
+      console.log(`Loaded ${expenses.length} expenses from local storage`);
+    } catch (error) {
+      expenses = [];
+      idCounter = 1;
+    }
+  }
 }
 
 app.use(cors());
+app.options("*", cors());
 app.use(express.json());
 
 function computeSummary() {
@@ -382,6 +465,15 @@ app.delete("/api/expenses/:id", withLangSmithTracing("delete_expense"), async (r
       return;
     }
 
+    // Delete from MongoDB if connected
+    if (expensesCollection) {
+      try {
+        await expensesCollection.deleteOne({ id });
+      } catch (error) {
+        console.error("Failed to delete from MongoDB:", error.message);
+      }
+    }
+
     await saveExpensesToDisk();
     traceToLangSmith(req, {
       inputs: { expense_id: id },
@@ -440,14 +532,33 @@ app.post("/api/analyze-receipt", withLangSmithTracing("analyze_receipt"), async 
       inputs: { text_length: typeof req.body?.text === "string" ? req.body.text.length : 0 },
       outputs: { provider: "local_fallback", receipt_generated: true, error: true }
     });
-    res.status(500).json({ error: "Failed to analyze receipt text" });
+    console.error("Receipt analysis failed:", error && error.message ? error.message : error);
+    // Return a local fallback instead of a 500 to avoid crashing clients when external
+    // receipt analysis (e.g., Google Gemini) fails or is unreachable.
+    res.json({ analysis: null, local: true, provider: "local_fallback", error: true });
   }
 });
 
-loadExpensesFromDisk().finally(() => {
+async function startServer() {
+  await connectToMongoDB();
+  await loadExpensesFromDisk();
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`BillScan backend running on port ${PORT}`);
   });
-});
+}
+
+// Only start an HTTP listener when this file is run directly (CLI), not when imported
+// by a serverless wrapper (like Vercel). Vercel sets the VERCEL env var during runtime;
+// additionally ensure argv matches the current file for local CLI runs.
+const isDirectRun = !process.env.VERCEL && process.argv[1] && path.resolve(process.argv[1]) === __filename;
+
+if (isDirectRun) {
+  startServer().catch((error) => {
+    console.error("Failed to start server:", error);
+    process.exit(1);
+  });
+}
+
+export default app;
 
 
